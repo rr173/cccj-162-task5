@@ -21,7 +21,12 @@
   * 接收端按摘要复用已有对象 (REUSED), 缺失对象才实际传输;
   * finalize 对 *全部* 对象在目标存储重读重算哈希, 任一缺失/不符/清单
     变化都不产生可恢复代际 (任务 FAILED, 保留释放);
-  * 全部校验通过后原子写入发布目录 (published catalog), 代际才一次发布。
+  * 全部校验通过后原子写入发布目录 (published catalog), 代际才一次发布;
+  * 任务在发布前撤销/校验终止时, 对 *本任务写入接收端* 的 blob 做一次
+    终态遗留清扫: 只删除不再被任何人引用的本次独占内容; 已有同摘要内容
+    (REUSED)、其他进行中搬运涉及的对象、已发布恢复版本引用的对象一律
+    保留。清扫结果随 ``migration_orphan_cleaned`` 事件持久化, 服务重启、
+    重复撤销与回收并发时不会重复统计, 也不会误删仍可用的内容。
 
 本模块只提供无锁的纯函数/视图; 锁与事件编排由 JobManager 负责
 (加锁顺序: reference → migration → gc → 各 Job.lock)。
@@ -60,6 +65,14 @@ REASON_DEST_DIGEST = "destination_digest_mismatch"
 REASON_INCOMPLETE = "incomplete_objects"
 REASON_DEST_WRITE = "destination_write_failed"
 REASON_CANCELLED = "cancelled_by_user"
+
+# 终态遗留清扫: 保留原因 / 恢复原因 (稳定 reason 码, API/页面/事件共用)
+KEEP_PUBLISHED = "published_generation"        # 已发布恢复版本仍引用
+KEEP_ACTIVE_MIGRATION = "active_migration"     # 其他进行中的搬运仍需要
+KEEP_DESTINATION_JOB = "destination_job_reference"  # 绑定该存储的本地作业引用
+KEEP_DELETE_FAILED = "delete_failed"           # 物理删除失败 (权限/IO)
+KEEP_DEST_UNAVAILABLE = "destination_unavailable"   # 接收端存储不可用
+RECOVER_ALREADY_DELETED = "already_deleted_after_crash"  # 崩溃前已物理删除
 
 KIND_SHARD = "checkpoint_shard"
 KIND_OUTPUT = "output"
@@ -233,6 +246,11 @@ def make_task(
         "reused_items": 0,
         "reused_bytes": 0,
         "failed_items": 0,
+        # 本任务物理写入接收端的 blob 摘要集合 (transferred/repaired);
+        # REUSED 对象是接收端已有内容, 绝不进入清扫候选。
+        "writes": set(),
+        # 终态遗留清扫结果 (取消/失败时执行一次, 随事件持久化)。
+        "cleanup": None,
         "error": None,
         "reason": None,
         "publication": None,
@@ -254,8 +272,18 @@ def recount(task: dict[str, Any]) -> None:
         o["size"] for o in task["objects"] if o["status"] == ITEM_REUSED)
 
 
+def cleanup_public(cleanup: dict[str, Any] | None) -> dict[str, Any] | None:
+    """终态遗留清扫结果的稳定 JSON 视图 (None 表示尚未清扫/不需要)。"""
+    if cleanup is None:
+        return None
+    view = dict(cleanup)
+    view["kept"] = [dict(k) for k in cleanup.get("kept", [])]
+    view["recovery_reasons"] = dict(cleanup.get("recovery_reasons", {}))
+    return view
+
+
 def task_public(task: dict[str, Any]) -> dict[str, Any]:
-    """稳定 JSON 视图 (清单/逐项进度/聚合计数/最终状态与原因)。"""
+    """稳定 JSON 视图 (清单/逐项进度/聚合计数/最终状态与原因/遗留清扫)。"""
     return {
         "migration_id": task["migration_id"],
         "source_job_id": task["source_job_id"],
@@ -278,6 +306,8 @@ def task_public(task: dict[str, Any]) -> dict[str, Any]:
         "reused_bytes": task["reused_bytes"],
         "failed_items": task["failed_items"],
         "done_items": task["transferred_items"] + task["reused_items"],
+        "written_blobs": sorted(task.get("writes") or ()),
+        "cleanup": cleanup_public(task.get("cleanup")),
         "error": task.get("error"),
         "reason": task.get("reason"),
         "publication": task.get("publication"),

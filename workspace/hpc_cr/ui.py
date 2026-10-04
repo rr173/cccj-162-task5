@@ -99,6 +99,41 @@ def render_gc_section(gc_plans: list[dict], job_id: str) -> str:
     """ % (_h(job_id), "".join(blocks))
 
 
+def _render_cleanup(cleanup: dict | None) -> str:
+    """终态遗留清扫区块: 本次写入/删除/保留/崩溃恢复统计与保留原因。"""
+    if not cleanup:
+        return ""
+    kept = cleanup.get("kept") or []
+    kept_rows = "".join(
+        f"<tr><td><code>{_h(k['blob'][:16])}</code></td>"
+        f"<td>{_h(k['reason'])}</td>"
+        f"<td><small>{_h(k.get('error') or '')}</small></td></tr>"
+        for k in kept[:50]
+    )
+    kept_table = ""
+    if kept_rows:
+        kept_table = f"""
+        <details><summary>保留明细 ({cleanup['kept_items']} 项 —
+        已有/进行中搬运/已发布内容继续可用)</summary>
+        <table border="1" cellpadding="6"><tr><th>blob</th>
+        <th>保留原因</th><th>错误</th></tr>{kept_rows}</table></details>"""
+    recovery = ""
+    if cleanup.get("recovered_items"):
+        recovery = (f" · 崩溃恢复 {cleanup['recovered_items']} 项 "
+                    f"<small>{_h(cleanup.get('recovery_reasons') or {})}</small>")
+    trigger = {"cancelled": "撤销", "failed": "校验终止"}.get(
+        cleanup.get("trigger"), cleanup.get("trigger"))
+    replay = " · 重启补扫" if cleanup.get("crash_recovery") else ""
+    return f"""
+        <p><small>遗留清扫 ({_h(trigger)}{replay}, 完成于
+        {_ts(cleanup.get('cleaned_ts'))}): 本次写入
+        <b>{cleanup['written_items']}</b> 项 · 删除独占遗留
+        <b>{cleanup['deleted_items']}</b> 项
+        ({cleanup['deleted_bytes']}B) · 保留
+        <b>{cleanup['kept_items']}</b> 项{recovery}</small></p>
+        {kept_table}"""
+
+
 def render_migration_section(data: dict) -> str:
     migrations = data.get("migrations") or []
     published = data.get("published_generations") or []
@@ -132,6 +167,7 @@ def render_migration_section(data: dict) -> str:
             state_note = f"取消原因: {_h(m.get('reason'))}"
         elif m["state"] == "PUBLISHED":
             state_note = "全部内容校验通过, 可恢复代际已一次性发布"
+        cleanup_html = _render_cleanup(m.get("cleanup"))
         blocks.append(f"""
         <h3>迁移 <code>{_h(m['migration_id'])}</code> {_badge(m['state'])}
         <small>→ {_h(m['destination_id'])}</small></h3>
@@ -151,6 +187,7 @@ def render_migration_section(data: dict) -> str:
           <div style="background:#0a7d2c;width:{pct}%;height:14px;border-radius:7px"></div>
         </div>
         <p>{state_note}</p>
+        {cleanup_html}
         <details><summary>对象明细 (前 100 项)</summary>
         <table border="1" cellpadding="6"><tr><th>对象</th><th>类型</th>
         <th>摘要</th><th>大小</th><th>状态</th><th>尝试</th><th>错误</th></tr>

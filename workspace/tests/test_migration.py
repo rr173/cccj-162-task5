@@ -267,7 +267,12 @@ class MigrationFailureTest(MigrationTestBase):
         final = self.mgr.finalize_migration("m-1")
         self.assertEqual(final["state"], "FAILED")
         self.assertFalse(self.mgr.list_published_generations("cluster-b"))
-        # 失败后释放保留; 修复目标对象后, 用一个新任务完成迁移
+        # 校验终止即清扫本任务独占遗留: m-1 写入的 r1 副本被回收,
+        # 接收端预先存在的 r0 (损坏) 不是本任务写入, 留在原地
+        self.assertFalse(dst.has(sha256_hex(b"shard-r1-gen1")))
+        self.assertEqual(final["cleanup"]["deleted_items"], 1)
+        # 失败后释放保留; 修复目标对象后, 用一个新任务完成迁移:
+        # r0 按摘要复用, r1 因遗留已被清扫而重新传输
         dst.delete(digest_r0)
         dst.put(b"shard-r0-gen1")
         self.mgr.create_migration(
@@ -275,7 +280,8 @@ class MigrationFailureTest(MigrationTestBase):
             migration_id="m-2")
         done = self.mgr.transfer_migration("m-2")
         self.assertEqual(done["state"], "PUBLISHED")
-        self.assertEqual(done["reused_items"], self.world_size)
+        self.assertEqual(done["reused_items"], self.world_size - 1)
+        self.assertEqual(done["transferred_items"], 1)
 
     def test_corrupt_repaired_via_source_resumes_and_publishes(self):
         self._complete_gen1()

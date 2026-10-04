@@ -154,6 +154,28 @@ def run_demo(data_dir: str | None = None) -> tuple[JobManager, str, str, str]:
     print("临时保留已释放, 当前保留 blob 数:",
           len(mgr.migration_holds()))
 
+    banner("8) 搬运未完成即撤销: 接收端独占遗留恰好清扫一次")
+    dst_dir_c = os.path.join(data_dir or tempfile.gettempdir(),
+                             "cluster-c-storage")
+    os.makedirs(dst_dir_c, exist_ok=True)
+    mgr.register_destination("cluster-c", data_dir=dst_dir_c)
+    mig2 = mgr.create_migration(
+        "climate-7", generation=1, destination_id="cluster-c")
+    part = mgr.transfer_migration(
+        mig2["migration_id"], auto_finalize=False, limit=3)
+    print(f"传输中断: 已写入接收端 {part['transferred_items']} 个对象后撤销")
+    cancelled = mgr.cancel_migration(mig2["migration_id"])
+    cl = cancelled["cleanup"]
+    print(f"任务 {cancelled['migration_id']} -> {cancelled['state']}: "
+          f"本次写入 {cl['written_items']} 项, 删除独占遗留 "
+          f"{cl['deleted_items']} 项 ({cl['deleted_bytes']}B), "
+          f"保留 {cl['kept_items']} 项")
+    again = mgr.cancel_migration(mig2["migration_id"])
+    print("重复撤销幂等, 清扫统计不变:",
+          again["cleanup"] == cl)
+    print("cluster-b 已发布恢复版本不受影响, 仍可 adopt:",
+          len(mgr.list_published_generations("cluster-b")) == 1)
+
     return mgr, "climate-7", token, new_lease
 
 

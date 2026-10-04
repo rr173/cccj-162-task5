@@ -54,6 +54,11 @@ from .migration import (
     ITEM_PLANNED as MIG_ITEM_PLANNED,
     ITEM_REUSED as MIG_ITEM_REUSED,
     ITEM_TRANSFERRED as MIG_ITEM_TRANSFERRED,
+    KEEP_ACTIVE_MIGRATION,
+    KEEP_DELETE_FAILED,
+    KEEP_DEST_UNAVAILABLE,
+    KEEP_DESTINATION_JOB,
+    KEEP_PUBLISHED,
     KIND_OUTPUT as MIG_KIND_OUTPUT,
     KIND_SHARD as MIG_KIND_SHARD,
     PLANNED as MIG_PLANNED,
@@ -63,8 +68,10 @@ from .migration import (
     REASON_INCOMPLETE,
     REASON_MANIFEST_CHANGED,
     REASON_SOURCE_DIGEST,
+    RECOVER_ALREADY_DELETED,
     TERMINAL_STATES as MIG_TERMINAL,
     TRANSFERRING as MIG_TRANSFERRING,
+    cleanup_public,
     current_manifest_digest,
     freeze_manifest,
     make_task,
@@ -108,6 +115,8 @@ GC_GENERATION_UNPIN = "gc_generation_unpin"
 # 迁移生命周期事件。带 migration_id 的事件不归属具体作业 (除
 # generation_adopted: 接收端集群的接收作业); 发布/取消/失败/创建/采用
 # 会改变引用/保留关系, 进入 GC 水位; 逐项传输事件不影响引用关系。
+# migration_orphan_cleaned 只删除接收端存储上的无引用遗留, 不改变源端
+# 引用关系, 因此不推进 GC 水位。
 MIG_DEST_REGISTERED = "migration_destination_registered"
 MIG_TASK_CREATED = "migration_created"
 MIG_TASK_STARTED = "migration_started"
@@ -115,6 +124,7 @@ MIG_OBJECT_DONE = "migration_object_done"
 MIG_TASK_PUBLISHED = "migration_published"
 MIG_TASK_FAILED = "migration_failed"
 MIG_TASK_CANCELLED = "migration_cancelled"
+MIG_ORPHAN_CLEANED = "migration_orphan_cleaned"
 GENERATION_ADOPTED = "generation_adopted"
 
 # 会改变"仍可访问数据引用关系/保留代际"的事件。GC 计划水位只跟踪这些事件。
@@ -142,6 +152,7 @@ _MIG_TASK_EVENTS = frozenset({
     MIG_TASK_PUBLISHED,
     MIG_TASK_FAILED,
     MIG_TASK_CANCELLED,
+    MIG_ORPHAN_CLEANED,
 })
 
 
@@ -448,6 +459,9 @@ class JobManager:
         self._published: dict[tuple, dict] = {}
         self._replay()
         self._recording = True
+        # 崩溃窗口恢复: 终态事件已落盘但遗留清扫事件缺失的迁移, 重启后
+        # 按同一规则补扫 (物理删除幂等, 统计随事件落盘后不再变化)。
+        self._recover_pending_cleanups()
 
     @contextmanager
     def _reference_section(self):
@@ -1443,7 +1457,7 @@ class JobManager:
 
     def _finish_failed(self, task: dict, reason: str, message: str, *,
                        release: bool, ts: float) -> None:
-        """任务终态失败: 不发布可恢复代际, 释放临时保留。"""
+        """任务终态失败: 不发布可恢复代际, 释放临时保留并清扫接收端遗留。"""
         task["state"] = MIG_FAILED
         task["reason"] = reason
         task["error"] = message
@@ -1460,6 +1474,7 @@ class JobManager:
             "released_holds": released,
             "task": task_public(task),
         }, ts=ts)
+        self._sweep_destination_orphans(task, ts=ts)
 
     def transfer_migration(
         self, migration_id: str, *,
@@ -1477,6 +1492,7 @@ class JobManager:
         with self._reference_lock, self._migration_lock:
             task = self._get_task(migration_id)
             if task["state"] in MIG_TERMINAL:
+                self._ensure_orphan_cleanup(task)
                 return task_public(task)
             job = self.get(task["source_job_id"])
             dst = self._destinations[task["destination_id"]]
@@ -1563,10 +1579,17 @@ class JobManager:
                 try:
                     if was_corrupt:
                         dst.rewrite(digest, data)
+                        # 修复重写也是本任务的物理写入 (原有内容已损坏),
+                        # 终态清扫可将其作为本任务遗留回收。
+                        task["writes"].add(digest)
                     else:
-                        stored_digest, _size, _new = dst.put(data)
+                        stored_digest, _size, stored_new = dst.put(data)
                         if stored_digest != digest:
                             raise Conflict("destination digest mismatch")
+                        if stored_new:
+                            # 仅当 blob 由本任务真正写入才计入清扫候选;
+                            # 接收端已有同摘要内容 ("已有内容") 绝不回收。
+                            task["writes"].add(digest)
                 except (OSError, Conflict, ValidationError):
                     item["status"] = MIG_ITEM_FAILED
                     item["last_error"] = REASON_DEST_DIGEST
@@ -1614,6 +1637,7 @@ class JobManager:
         with self._reference_lock, self._migration_lock:
             task = self._get_task(migration_id)
             if task["state"] in MIG_TERMINAL:
+                self._ensure_orphan_cleanup(task)
                 return task_public(task)
             self._finalize_locked(task)
             return task_public(task)
@@ -1690,11 +1714,15 @@ class JobManager:
                          reason: str = REASON_CANCELLED) -> dict:
         """取消活跃迁移: 不发布代际, 立即释放本任务的临时保留。
 
-        已复制到接收端的对象作为无引用 orphan 留给正常 GC; 取消终态幂等。
+        取消即对 *本任务写入接收端* 的 blob 做一次终态遗留清扫: 只删除
+        不再被引用的本次独占内容 (已有同摘要内容、其他进行中搬运涉及的
+        对象、已发布恢复版本引用的对象一律保留)。取消与清扫都幂等:
+        重复撤销返回同一份已持久化的终态统计, 不会重复删除或重复计数。
         """
         with self._reference_lock, self._migration_lock:
             task = self._get_task(migration_id)
             if task["state"] in MIG_TERMINAL:
+                self._ensure_orphan_cleanup(task)
                 return task_public(task)
             ts = time.time()
             task["state"] = MIG_CANCELLED
@@ -1713,7 +1741,135 @@ class JobManager:
                 "released_holds": released,
                 "task": task_public(task),
             }, ts=ts)
+            self._sweep_destination_orphans(task, ts=ts)
             return task_public(task)
+
+    # -------------------------------------------- destination orphan sweep
+    def _ensure_orphan_cleanup(self, task: dict) -> None:
+        """终态任务保证恰好一次遗留清扫 (重复撤销/重启只读回同一结果)。"""
+        if task["state"] in (MIG_FAILED, MIG_CANCELLED) \
+                and task.get("cleanup") is None:
+            self._sweep_destination_orphans(task, ts=time.time())
+
+    def _destination_protected_blobs(
+            self, task: dict, dst: ContentStore) -> dict[str, str]:
+        """目标存储上仍被引用的 blob -> 保护原因。
+
+        调用方持有 reference + migration 锁 (上传/恢复/其他迁移/GC 均被
+        同一临界区挡住), 因此这里的引用视图与随后的物理删除原子一致:
+        只可能删除"本任务写入且此刻无人引用"的内容。
+        """
+        protected: dict[str, str] = {}
+        # 已公布的恢复版本 (接收端 adopt 的依据) 必须继续可用
+        for rec in self._published.values():
+            if self._destinations.get(rec["destination_id"]) is dst:
+                for obj in rec["manifest"]["objects"]:
+                    protected.setdefault(obj["blob"], KEEP_PUBLISHED)
+        # 其他进行中的搬运 (同一物理存储) 涉及的对象必须继续可用
+        for other in self._migrations.values():
+            if other["migration_id"] == task["migration_id"] \
+                    or other["state"] not in MIG_ACTIVE:
+                continue
+            if self._destinations.get(other["destination_id"]) is dst:
+                for obj in other["objects"]:
+                    protected.setdefault(obj["blob"], KEEP_ACTIVE_MIGRATION)
+        # 绑定到该存储的本地作业 (如同进程内 adopt 后恢复运行的作业)
+        for job in self._jobs.values():
+            if job.store is not dst:
+                continue
+            with job.lock:
+                for cp in job.cpm.list_all():
+                    for sh in cp.shards.values():
+                        protected.setdefault(sh.blob, KEEP_DESTINATION_JOB)
+                for out in job.outputs.list():
+                    protected.setdefault(out.blob, KEEP_DESTINATION_JOB)
+        return protected
+
+    def _sweep_destination_orphans(
+            self, task: dict, *, ts: float,
+            crash_recovery: bool = False) -> None:
+        """删除本任务写入接收端、且此刻无人引用的遗留 blob (终态恰好一次)。
+
+        候选只来自 ``task["writes"]`` (本任务物理写入的摘要); REUSED 对象
+        是接收端已有内容, 永不成为候选。删除幂等: 崩溃发生在物理删除与
+        清扫事件落盘之间时, 重启补扫把已消失的 blob 计入
+        ``already_deleted_after_crash``; 结果随 ``migration_orphan_cleaned``
+        事件持久化, 之后重复撤销/重启/并发回收都只读回同一份统计。
+        """
+        if task.get("cleanup") is not None:
+            return
+        dst = self._destinations.get(task["destination_id"])
+        written = sorted(task.get("writes") or ())
+        kept: list[dict] = []
+        deleted_items = deleted_bytes = recovered_items = 0
+        recovery_reasons: dict[str, int] = {}
+        if dst is None:
+            kept.extend({"blob": b, "reason": KEEP_DEST_UNAVAILABLE}
+                        for b in written)
+        else:
+            protected = self._destination_protected_blobs(task, dst)
+            for blob in written:
+                reason = protected.get(blob)
+                if reason is not None:
+                    kept.append({"blob": blob, "reason": reason})
+                    continue
+                try:
+                    existed, freed = dst.delete(blob)
+                except OSError as exc:
+                    kept.append({"blob": blob,
+                                 "reason": KEEP_DELETE_FAILED,
+                                 "error": str(exc)})
+                    continue
+                if existed:
+                    deleted_items += 1
+                    deleted_bytes += freed
+                else:
+                    # 崩溃恢复/易失接收端: 内容已不在, 计入回收并记录原因
+                    recovered_items += 1
+                    recovery_reasons[RECOVER_ALREADY_DELETED] = \
+                        recovery_reasons.get(RECOVER_ALREADY_DELETED, 0) + 1
+        cleanup = {
+            "state": "COMPLETED",
+            "trigger": ("cancelled" if task["state"] == MIG_CANCELLED
+                        else "failed"),
+            "crash_recovery": crash_recovery,
+            "cleaned_ts": ts,
+            "written_items": len(written),
+            "deleted_items": deleted_items,
+            "deleted_bytes": deleted_bytes,
+            "kept_items": len(kept),
+            "kept": kept,
+            "recovered_items": recovered_items,
+            "recovery_reasons": recovery_reasons,
+        }
+        task["cleanup"] = cleanup
+        self._record_global(MIG_ORPHAN_CLEANED, {
+            "migration_id": task["migration_id"],
+            "job_id": task["source_job_id"],
+            "source_job_id": task["source_job_id"],
+            "source_generation": task["source_generation"],
+            "destination_id": task["destination_id"],
+            "task_state": task["state"],
+            "cleanup": cleanup_public(cleanup),
+        }, ts=ts)
+
+    def _recover_pending_cleanups(self) -> None:
+        """重启补扫: 终态事件已落盘但清扫事件缺失的迁移任务。
+
+        与正常运行路径共用同一临界区与同一清扫规则; 已物理删除的 blob
+        以恢复原因计入统计, 保证终态统计在重启后稳定可查询。
+        """
+        pending = [
+            t for t in self._migrations.values()
+            if t["state"] in (MIG_FAILED, MIG_CANCELLED)
+            and t.get("cleanup") is None
+        ]
+        if not pending:
+            return
+        with self._reference_lock, self._migration_lock:
+            for task in pending:
+                self._sweep_destination_orphans(
+                    task, ts=time.time(), crash_recovery=True)
 
     def get_migration(self, migration_id: str) -> dict:
         with self._migration_lock:
@@ -2574,6 +2730,8 @@ class JobManager:
                 "reused_items": 0,
                 "reused_bytes": 0,
                 "failed_items": 0,
+                "writes": set(),
+                "cleanup": None,
                 "error": None,
                 "reason": None,
                 "publication": None,
@@ -2595,7 +2753,14 @@ class JobManager:
                 item["status"] = detail["status"]
                 item["attempts"] = int(detail.get("attempts") or 1)
                 item["completed_ts"] = ts
+            # 本任务物理写入接收端的 blob (transferred/repaired) 是终态
+            # 遗留清扫的唯一候选来源; REUSED 是接收端已有内容, 不进入。
+            if detail.get("outcome") in ("transferred", "repaired"):
+                task["writes"].add(detail["blob"])
             recount(task)
+        elif etype == MIG_ORPHAN_CLEANED:
+            # 终态遗留清扫结果: 权威覆盖, 重启后统计与原因稳定可查询
+            task["cleanup"] = detail.get("cleanup")
         elif etype in (MIG_TASK_PUBLISHED, MIG_TASK_FAILED,
                        MIG_TASK_CANCELLED):
             view = detail["task"]
@@ -2614,6 +2779,10 @@ class JobManager:
                     cur["attempts"] = vo.get("attempts", cur["attempts"])
                     cur["last_error"] = vo.get("last_error")
                     cur["completed_ts"] = vo.get("completed_ts")
+            # 本任务写入集合与清扫结果同样以终态视图为准 (清扫事件在
+            # 终态事件之后落盘, 若存在会再覆盖一次 cleanup)。
+            task["writes"] = set(view.get("written_blobs") or ())
+            task["cleanup"] = view.get("cleanup")
             recount(task)
             if etype == MIG_TASK_PUBLISHED:
                 record = {
