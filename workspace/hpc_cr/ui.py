@@ -99,6 +99,50 @@ def render_gc_section(gc_plans: list[dict], job_id: str) -> str:
     """ % (_h(job_id), "".join(blocks))
 
 
+def _render_cleanup_note(cleanup):
+    """终态 (取消/失败) 接收端独占遗留清理: 稳定统计 + 逐项保留/删除原因。"""
+    if not cleanup:
+        return ""
+    skip_reasons = cleanup.get("skip_reasons") or {}
+    recovery = cleanup.get("recovery_reasons") or {}
+    reason_bits = "".join(
+        f"<li>{_h(k)} × {v}</li>" for k, v in
+        sorted(skip_reasons.items()))
+    recovery_bits = "".join(
+        f"<li>{_h(k)} × {v}</li>" for k, v in
+        sorted(recovery.items()))
+    rows = "".join(
+        f"<tr><td><code>{_h(c.get('object_id') or '')}</code></td>"
+        f"<td><code>{_h((c.get('blob') or '')[:16])}</code></td>"
+        f"<td>{c.get('size', 0)}</td>"
+        f"<td>{_h(c.get('disposition') or '')}</td>"
+        f"<td><small>{_h(c.get('reason') or '')}</small></td></tr>"
+        for c in cleanup.get("candidates", [])[:100]
+    )
+    detail = ""
+    if rows:
+        detail = (
+            "<details><summary>遗留清理逐项明细 (前 100 项)</summary>"
+            '<table border="1" cellpadding="6"><tr><th>对象</th><th>摘要</th>'
+            "<th>字节</th><th>处置</th><th>原因</th></tr>"
+            f"{rows}</table></details>")
+    return f"""
+        <h4>接收端遗留清理 <span class="badge">{_h(cleanup.get('state'))}</span></h4>
+        <table border="1" cellpadding="6">
+          <tr><th>候选(本次独占写入)</th><th>已删除项</th><th>已删除字节</th>
+          <th>保留项</th></tr>
+          <tr><td>{cleanup.get('candidate_items', 0)}
+          ({cleanup.get('candidate_bytes', 0)}B)</td>
+          <td>{cleanup.get('deleted_items', 0)}</td>
+          <td>{cleanup.get('deleted_bytes', 0)}</td>
+          <td>{cleanup.get('skipped_items', 0)}</td></tr>
+        </table>
+        <small>只删除本任务实际写入且当前无人引用的对象; 搬运前已存在的同摘要
+        内容、其他进行中搬运、已发布代际与 adopt 引用一律保留。</small>
+        <ul>{reason_bits}{recovery_bits}</ul>
+        {detail}"""
+
+
 def render_migration_section(data: dict) -> str:
     migrations = data.get("migrations") or []
     published = data.get("published_generations") or []
@@ -132,6 +176,7 @@ def render_migration_section(data: dict) -> str:
             state_note = f"取消原因: {_h(m.get('reason'))}"
         elif m["state"] == "PUBLISHED":
             state_note = "全部内容校验通过, 可恢复代际已一次性发布"
+        cleanup_note = _render_cleanup_note(m.get("cleanup"))
         blocks.append(f"""
         <h3>迁移 <code>{_h(m['migration_id'])}</code> {_badge(m['state'])}
         <small>→ {_h(m['destination_id'])}</small></h3>
@@ -151,6 +196,7 @@ def render_migration_section(data: dict) -> str:
           <div style="background:#0a7d2c;width:{pct}%;height:14px;border-radius:7px"></div>
         </div>
         <p>{state_note}</p>
+        {cleanup_note}
         <details><summary>对象明细 (前 100 项)</summary>
         <table border="1" cellpadding="6"><tr><th>对象</th><th>类型</th>
         <th>摘要</th><th>大小</th><th>状态</th><th>尝试</th><th>错误</th></tr>

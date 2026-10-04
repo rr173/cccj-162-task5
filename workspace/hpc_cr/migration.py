@@ -61,6 +61,25 @@ REASON_INCOMPLETE = "incomplete_objects"
 REASON_DEST_WRITE = "destination_write_failed"
 REASON_CANCELLED = "cancelled_by_user"
 
+# 终态 (CANCELLED/FAILED) 接收端遗留内容清理。清理 *只* 针对本次搬运独占
+# 写入 (TRANSFERRED) 的对象: REUSED 对象搬运前已在接收端存在,
+# FAILED/PLANNED 对象本次从未成功写入 —— 它们都不是"本次独占的遗留",
+# 删除任何一个都可能误伤他人内容。
+CLEANUP_RUNNING = "RUNNING"
+CLEANUP_DONE = "DONE"
+CLEANUP_PENDING = "PENDING"
+CLEANUP_DELETED = "DELETED"
+CLEANUP_SKIPPED = "SKIPPED"
+
+# 稳定的跳过/恢复原因 (API、页面、事件共用同一组词)
+SKIP_PUBLISHED_REFERENCE = "published_generation_reference"
+SKIP_DEST_JOB_REFERENCE = "destination_job_reference"
+SKIP_OTHER_MIGRATION = "shared_with_other_migration"
+SKIP_ALREADY_ABSENT = "already_absent"
+SKIP_DELETE_FAILED = "delete_failed"
+SKIP_DEST_UNAVAILABLE = "destination_store_unavailable"
+RECOVERY_ALREADY_DELETED = "already_deleted_after_crash"
+
 KIND_SHARD = "checkpoint_shard"
 KIND_OUTPUT = "output"
 
@@ -236,6 +255,7 @@ def make_task(
         "error": None,
         "reason": None,
         "publication": None,
+        "cleanup": None,
     }
 
 
@@ -252,6 +272,89 @@ def recount(task: dict[str, Any]) -> None:
         if o["status"] == ITEM_TRANSFERRED)
     task["reused_bytes"] = sum(
         o["size"] for o in task["objects"] if o["status"] == ITEM_REUSED)
+
+
+# ----------------------------------------------------- terminal orphan cleanup
+def make_cleanup(task: dict[str, Any], *, terminal_state: str,
+                 reason: str, ts: float) -> dict[str, Any]:
+    """构造终态遗留清理计划。
+
+    候选只包含本任务 **实际写入** 接收端的对象 (TRANSFERRED, 含损坏修复);
+    REUSED 在搬运前已存在, PLANNED/ITEM_FAILED 未被本次成功写入, 一律不
+    进入计划 —— 终态清理只能删除本次搬运独占产生的内容。
+    """
+    candidates = [
+        {
+            "object_id": o["object_id"],
+            "kind": o["kind"],
+            "blob": o["blob"],
+            "size": o["size"],
+            "disposition": None,
+            "reason": None,
+            "deleted_ts": None,
+        }
+        for o in task["objects"]
+        if o["status"] == ITEM_TRANSFERRED
+    ]
+    return {
+        "state": CLEANUP_RUNNING,
+        "terminal_state": terminal_state,
+        "reason": reason,
+        "started_ts": ts,
+        "finished_ts": None,
+        "candidates": candidates,
+        "candidate_items": len(candidates),
+        "candidate_bytes": sum(c["size"] for c in candidates),
+        "deleted_items": 0,
+        "deleted_bytes": 0,
+        "skipped_items": 0,
+        "skip_reasons": {},
+        "recovery_reasons": {},
+    }
+
+
+def cleanup_recount(cleanup: dict[str, Any]) -> None:
+    """从逐项处置重算清理聚合 (崩溃续跑/事件重放后以此为准)。"""
+    cleanup["candidate_items"] = len(cleanup["candidates"])
+    cleanup["candidate_bytes"] = sum(c["size"] for c in cleanup["candidates"])
+    cleanup["deleted_items"] = sum(
+        1 for c in cleanup["candidates"] if c["disposition"] == CLEANUP_DELETED)
+    cleanup["skipped_items"] = sum(
+        1 for c in cleanup["candidates"]
+        if c["disposition"] == CLEANUP_SKIPPED)
+    cleanup["deleted_bytes"] = sum(
+        c["size"] for c in cleanup["candidates"]
+        if c["disposition"] == CLEANUP_DELETED)
+
+
+def cleanup_public(cleanup: dict[str, Any] | None) -> dict[str, Any] | None:
+    """清理统计的稳定 JSON 视图 (终态任务页面/API 据此查询)。"""
+    if not cleanup:
+        return None
+    return {
+        "state": cleanup["state"],
+        "terminal_state": cleanup.get("terminal_state"),
+        "reason": cleanup.get("reason"),
+        "started_ts": cleanup.get("started_ts"),
+        "finished_ts": cleanup.get("finished_ts"),
+        "candidate_items": cleanup.get("candidate_items", 0),
+        "candidate_bytes": cleanup.get("candidate_bytes", 0),
+        "deleted_items": cleanup.get("deleted_items", 0),
+        "deleted_bytes": cleanup.get("deleted_bytes", 0),
+        "skipped_items": cleanup.get("skipped_items", 0),
+        "skip_reasons": dict(cleanup.get("skip_reasons", {})),
+        "recovery_reasons": dict(cleanup.get("recovery_reasons", {})),
+        "candidates": [dict(c) for c in cleanup.get("candidates", [])],
+    }
+
+
+def cleanup_summary(cleanup: dict[str, Any] | None) -> dict[str, Any] | None:
+    """无逐项明细的摘要视图 (嵌入任务终态事件, 明细由逐 blob 事件重建)。"""
+    if not cleanup:
+        return None
+    public = cleanup_public(cleanup)
+    public.pop("candidates", None)
+    return public
 
 
 def task_public(task: dict[str, Any]) -> dict[str, Any]:
@@ -281,6 +384,7 @@ def task_public(task: dict[str, Any]) -> dict[str, Any]:
         "error": task.get("error"),
         "reason": task.get("reason"),
         "publication": task.get("publication"),
+        "cleanup": cleanup_public(task.get("cleanup")),
         "manifest": task["manifest"],
         "objects": [dict(o) for o in task["objects"]],
     }

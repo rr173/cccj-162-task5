@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 import tempfile
 import threading
+import uuid
 from dataclasses import dataclass, field
 
 from .errors import Conflict, NotFound, ValidationError
@@ -33,14 +34,32 @@ class ContentStore:
         self._lock = threading.Lock()
         self._data_dir = data_dir
         self._disk = data_dir is not None
+        # 物理后端身份: 同一 blob 目录的两个 ContentStore 实例指向同一物理
+        # 存储; 内存实例各自独立。迁移清理据此识别"接收端其实就是源存储"
+        # 这类别名, 避免把仍被引用的内容当成接收端孤儿删掉。
         if data_dir is not None:
             self._blob_dir = os.path.join(data_dir, "blobs")
             os.makedirs(self._blob_dir, exist_ok=True)
             # 重启后内存为空, 磁盘上已有哪些 blob 直接列目录
             for name in os.listdir(self._blob_dir):
                 self._blobs.setdefault(name, None)  # 惰性加载
+            self._backend_id = ("dir:" +
+                                os.path.realpath(self._blob_dir))
         else:
             self._blob_dir = None
+            self._backend_id = f"mem:{uuid.uuid4().hex}"
+
+    @property
+    def backend_id(self) -> str:
+        return self._backend_id
+
+    def same_backend(self, other: "ContentStore") -> bool:
+        """是否指向同一物理 blob 集合 (同一磁盘目录或同一内存实例)。"""
+        if other is None:
+            return False
+        if self is other:
+            return True
+        return self._backend_id == getattr(other, "_backend_id", None)
 
     def put(self, data: bytes) -> tuple[str, int, bool]:
         """存储数据, 返回 (sha256, 长度, 是否新写入)。"""

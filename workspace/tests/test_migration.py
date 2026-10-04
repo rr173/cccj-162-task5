@@ -267,7 +267,9 @@ class MigrationFailureTest(MigrationTestBase):
         final = self.mgr.finalize_migration("m-1")
         self.assertEqual(final["state"], "FAILED")
         self.assertFalse(self.mgr.list_published_generations("cluster-b"))
-        # 失败后释放保留; 修复目标对象后, 用一个新任务完成迁移
+        # 失败后释放保留; 失败清理只删除本任务独占写入 (TRANSFERRED) 的对象,
+        # 损坏的复用项搬运前就存在, 不被清理。修复目标对象后用一个新任务
+        # 完成迁移: r0 被重新写入 (TRANSFERRED), r1 原内容完好则按摘要复用。
         dst.delete(digest_r0)
         dst.put(b"shard-r0-gen1")
         self.mgr.create_migration(
@@ -275,7 +277,8 @@ class MigrationFailureTest(MigrationTestBase):
             migration_id="m-2")
         done = self.mgr.transfer_migration("m-2")
         self.assertEqual(done["state"], "PUBLISHED")
-        self.assertEqual(done["reused_items"], self.world_size)
+        self.assertEqual(done["reused_items"], 1)
+        self.assertEqual(done["transferred_items"], 1)
 
     def test_corrupt_repaired_via_source_resumes_and_publishes(self):
         self._complete_gen1()
